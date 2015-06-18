@@ -191,10 +191,18 @@ handle_call({table_exists, TableName}, _From, State) ->
     Conn = State#state.read_connection,
     {reply, Adapter:table_exists(Conn, TableName), State};
 
+handle_call({execute, {Type, Commands}}, _From, State) ->
+    {Adapter, _, Conn} = db_for_type(Type, State),
+    {reply, Adapter:execute(Conn, Commands), State};
+
 handle_call({execute, Commands}, _From, State) ->
     Adapter = State#state.adapter,
     Conn = State#state.write_connection,
     {reply, Adapter:execute(Conn, Commands), State};
+
+handle_call({execute, {Type, Commands}, Params}, _From, State) ->
+    {Adapter, _, Conn} = db_for_type(Type, State),
+    {reply, Adapter:execute(Conn, Commands, Params), State};
 
 handle_call({execute, Commands, Params}, _From, State) ->
     Adapter = State#state.adapter,
