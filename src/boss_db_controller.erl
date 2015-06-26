@@ -2,7 +2,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start_link/1, try_connection/2]).
+-export([start_link/0, start_link/1, try_connection/2, try_connection/3]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
@@ -46,7 +46,10 @@ connections_for_adapter(Adapter, Options) ->
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-setup_reconnect(State =#state{connection_delay = DelayTime}) ->
+setup_reconnect(State) ->
+    setup_reconnect(State, all).
+
+setup_reconnect(State = #state{connection_delay = DelayTime}, Conn) ->
     Delay = case DelayTime of
 		D when D < ?MAXDELAY ->
 		    D;
@@ -54,12 +57,19 @@ setup_reconnect(State =#state{connection_delay = DelayTime}) ->
 		    ?MAXDELAY
 	    end,
     Pid = self(),
-    timer:apply_after(Delay, boss_db_controller, try_connection, [Pid, State#state.options]).
-
+    case Conn of
+        all ->
+            timer:apply_after(Delay, boss_db_controller, try_connection, [Pid, State#state.options]);
+        _ ->
+            timer:apply_after(Delay, boss_db_controller, try_connection, [Pid, Conn, State#state.options])
+    end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 try_connection(Pid, Options) ->
     gen_server:cast(Pid, {try_connect, Options}).
+
+try_connection(Pid, Conn, Options) ->
+    gen_server:cast(Pid, {try_connect, Conn, Options}).
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -236,7 +246,45 @@ handle_cast({try_connect, Options}, State) when State#state.connection_state /= 
 	_Error ->
 	    reconnect_no_reply(Options, State, Adapter, CacheEnable, CacheTTL)
     end;
-
+handle_cast({try_connect, Conn, Options}, #state{read_connection = RC, write_connection = WC} = State)
+  when (State#state.connection_state /= connected) andalso (Conn =:= RC orelse Conn =:= WC) ->
+    Adapter = State#state.adapter,
+    try connections_for_adapter(Adapter, Options) of
+        {ok, {ReadConn, WriteConn}} ->
+            {noreply, State#state{connection_state = connected, connection_delay = 1,
+                                  read_connection = ReadConn, write_connection = WriteConn,
+                                  options = Options}};
+        _Failure ->
+            reconnect_no_reply(State, Conn)
+    catch
+        _Error ->
+            reconnect_no_reply(State, Conn)
+    end;
+handle_cast({try_connect, Conn, Options}, #state{shards = Shards} = State)
+  when State#state.connection_state /= connected ->
+    [{Adapter, _, _, MergedOptions}] = lists:filter(
+                                         fun({_, RC, WC, _}) when Conn =:= RC; Conn =:= WC ->
+                                                 true;
+                                            ({_, _, _, _}) ->
+                                                 false
+                                         end, Shards),
+    try connections_for_adapter(Adapter, MergedOptions) of
+	{ok, {ReadConn, WriteConn}} ->
+            NewShards = lists:keyreplace(
+                          Conn, 2, Shards,
+                          {Adapter, ReadConn, WriteConn, MergedOptions}),
+            NewShards1 = lists:keyreplace(
+                           Conn, 3, NewShards,
+                           {Adapter, ReadConn, WriteConn, MergedOptions}),
+	    {noreply, State#state{connection_state = connected, connection_delay = 1,
+                                  shards = NewShards1,
+                                  options = Options}};
+	_Failure ->
+	    reconnect_no_reply(State, Conn)
+    catch
+	_Error ->
+            reconnect_no_reply(State, Conn)
+    end;
 handle_cast(_Request, State) ->
     {noreply, State}.
 
@@ -251,7 +299,7 @@ terminate(_Reason, State) ->
 	    timer:cancel(Timer)
     end,
     terminate_connections(Adapter, State#state.read_connection, State#state.write_connection),
-    lists:map(fun({A, RC, WC}) -> terminate_connections(A, RC, WC) end, State#state.shards).
+    lists:map(fun({A, RC, WC, _}) -> terminate_connections(A, RC, WC) end, State#state.shards).
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -262,18 +310,23 @@ code_change(_OldVsn, State, _Extra) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 handle_info(stop, State) ->
     {stop, shutdown, State};
-
 handle_info({'EXIT', _From, 'normal'}, State) when State#state.adapter=:=boss_db_adapter_mongodb ->
-	%% Mongo Driver links and kills connection with each request, so capture it here and ignore it
+    %% Mongo Driver links and kills connection with each request, so capture it here and ignore it
     {noreply, State};
-handle_info({'EXIT', _From, _Reason}, State) when State#state.connection_state == connected ->
-    {ok, Tref} = setup_reconnect(State),
-    {noreply, State#state { connection_state = disconnected, connection_delay = State#state.connection_delay * 2,
-			    connection_retry_timer = Tref } };
-
-handle_info({'EXIT', _From, _Reason}, State) ->
-    {noreply, State#state { connection_state = disconnected } };
-
+handle_info({'EXIT', From, _Reason},
+            State = #state{read_connection = RC,
+                           write_connection = WC,
+                           shards = Shards}) ->
+    AllConns = lists:flatten([RC, WC, [[SRC, SWC] || {_, SRC, SWC, _} <- Shards]]),
+    case lists:member(From, AllConns) of
+        true ->
+            {ok, Tref} = setup_reconnect(State, From),
+            {noreply, State#state{connection_state = disconnected,
+                                  connection_delay = State#state.connection_delay * 2,
+                                  connection_retry_timer = Tref }};
+        _ ->
+            {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -365,6 +418,12 @@ reconnect_no_reply(Options, State, Adapter, CacheEnable, CacheTTL) ->
 		     adapter = Adapter, read_connection = undefined, write_connection = undefined,
                      options = Options, cache_enable = CacheEnable, cache_ttl = CacheTTL, cache_prefix = db}}.
 
+reconnect_no_reply(State, Conn) ->
+    {ok, Tref} = setup_reconnect(State, Conn),
+    {noreply, State#state{connection_state = disconnected,
+                     connection_delay = State#state.connection_delay * 2,
+		     connection_retry_timer = Tref}}.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 make_shards(Options, Adapter) ->
@@ -378,7 +437,7 @@ make_shards(Options, Adapter) ->
 				{ok, {ShardRead, ShardWrite}}   = connections_for_adapter(ShardAdapter, MergedOptions),
 				Index                           = erlang:length(ShardAcc),
 				NewDict                         = make_new_dict(ModelDictAcc, Models, Index),
-				{[{ShardAdapter, ShardRead, ShardWrite}|ShardAcc], NewDict}
+				{[{ShardAdapter, ShardRead, ShardWrite, MergedOptions}|ShardAcc], NewDict}
 			end
                 end, {[], dict:new()}, proplists:get_value(shards, Options, [])).
 
@@ -424,7 +483,8 @@ db_for_key(Key, State) ->
 db_for_type(Type, State = #state{model_dict = Dict}) ->
     case dict:find(Type, Dict) of
         {ok, Index} ->
-            lists:nth(Index + 1, State#state.shards);
+            {Adapter, RC, WC, _} = lists:nth(Index + 1, State#state.shards),
+            {Adapter, RC, WC};
         _ ->
             {State#state.adapter, State#state.read_connection, State#state.write_connection}
     end.

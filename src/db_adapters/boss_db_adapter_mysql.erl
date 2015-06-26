@@ -20,7 +20,7 @@ init(Options) ->
     DBIdentifier = proplists:get_value(db_shard_id, Options, boss_pool),
     Encoding     = utf8,
     mysql_conn:start_link(DBHost, DBPort, DBUsername, DBPassword, DBDatabase, 
-        fun(_, _, _, _) -> ok end, Encoding, DBIdentifier).
+        log_fun(), Encoding, DBIdentifier).
 
 terminate(Pid) -> 
     exit(Pid, normal).
@@ -513,3 +513,19 @@ lookup_single_parameter(Position, Parameters) ->
 	catch
 		Error -> throw(io_lib:format("Error (~p) getting parameter $~w. Provided Params: ~p", [Error, Position, Parameters]))
 	end.
+
+log_fun() ->
+    fun(Module, Line, Level, ParamFun) ->
+            {Fmt, Params} = ParamFun(),
+            Lv = lager_level(Level),
+            lager:log(Lv, self(),
+                      "Module:" ++ atom_to_list(Module) ++ ","
+                      "Line:" ++ integer_to_list(Line) ++ "," ++ Fmt,
+                      Params),
+            ok
+    end.
+
+lager_level(normal) ->
+    info;
+lager_level(Lv) ->
+    Lv.
